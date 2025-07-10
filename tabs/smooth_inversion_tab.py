@@ -9,11 +9,14 @@ from utils import setup_simpeg_simulation, run_smooth_inversion, plot_simpeg_sli
 
 # We need to reconstruct the mesh to get cell coordinates for the download
 from discretize import TensorMesh
+# NEW: Import cKDTree for efficiently mapping Euler solutions to the mesh
+from scipy.spatial import cKDTree
 
 
 class SmoothInversionTab:
     """
     Manages the layout and callbacks for the Smooth (L2) Inversion tab.
+    This version includes optimizations for speed and memory.
     """
     def __init__(self, app):
         self.app = app
@@ -24,6 +27,13 @@ class SmoothInversionTab:
         Defines the layout of the smooth inversion tab.
         """
         return html.Div([
+            dbc.Alert(
+                [
+                    html.I(className="bi bi-info-circle-fill me-2"),
+                    "For best results: Run Euler Deconvolution first, then use multiple CPU cores for this inversion.",
+                ],
+                color="info",
+            ),
             dbc.Button("▶️ Run Smooth Inversion", id='run-smooth-inversion-button', n_clicks=0, className="my-2", color="primary"),
             dcc.Loading(id="loading-smooth", children=[
                 html.Div(id='smooth-inversion-output'),
@@ -58,56 +68,78 @@ class SmoothInversionTab:
         @self.app.callback(
             Output('smooth-inversion-results-store', 'data'),
             Output('smooth-inversion-output', 'children'),
-            Output('smooth-download-controls', 'style'),  # Control visibility of download button
+            Output('smooth-download-controls', 'style'),
             Input('run-smooth-inversion-button', 'n_clicks'),
             [
+                # Data and Inversion Parameters
                 State('processed-data-store', 'data'),
                 State('x-col-dropdown', 'value'), State('y-col-dropdown', 'value'),
                 State('z-col-dropdown', 'value'), State('val-col-dropdown', 'value'),
                 State('use-constant-z-checkbox', 'value'), State('z-value-input', 'value'),
                 State('inducing-field-strength-input', 'value'), State('inclination-input', 'value'),
                 State('declination-input', 'value'),
-                # --- UPDATED: Read from new mesh controls ---
                 State('core-cell-size-x-input', 'value'),
                 State('core-cell-size-y-input', 'value'),
                 State('core-cell-size-z-input', 'value'),
                 State('padding-x-input', 'value'),
                 State('padding-y-input', 'value'),
                 State('padding-z-input', 'value'),
-                # --- END OF UPDATE ---
                 State('alpha-s-slider', 'value'), State('alpha-x-slider', 'value'),
                 State('alpha-y-slider', 'value'), State('alpha-z-slider', 'value'),
+                # --- NEW: Read from optimization controls ---
+                State('euler-results-store', 'data'),
+                State('cpu-count-dropdown', 'value'),
+                State('memory-mode-radio', 'value'),
             ],
             prevent_initial_call=True
         )
         def run_inversion(n_clicks, json_data, x_col, y_col, z_col, val_col, use_constant_z, z_value,
                           inducing_field, inclination, declination,
-                          csx, csy, csz, pad_x, pad_y, pad_z,  # <-- UPDATED parameters
-                          alpha_s, alpha_x, alpha_y, alpha_z):
+                          csx, csy, csz, pad_x, pad_y, pad_z,
+                          alpha_s, alpha_x, alpha_y, alpha_z,
+                          # --- NEW: Accept optimization arguments ---
+                          json_euler_results, n_cpu, memory_mode):
+
             if json_data is None:
                 return no_update, dbc.Alert("Please upload and process data first.", color="warning"), {'display': 'none'}
 
             df = pd.read_json(io.StringIO(json_data), orient='split')
             z_col_to_use = '_generated_z_' if use_constant_z else z_col
 
-            # --- SOLUTION: Add validation for Z column ---
             if not use_constant_z and z_col_to_use is None:
                 return no_update, dbc.Alert("Please select a Z (Elevation) column when 'Use a constant elevation' is unchecked.", color="danger"), {'display': 'none'}
-            # --- END OF SOLUTION ---
 
             try:
-                # --- UPDATED: Pass new mesh parameters to the simulation setup ---
+                # Pass the new optimization settings to the simulation setup
                 sim, data_obj, n_active = setup_simpeg_simulation(
                     df, x_col, y_col, z_col_to_use, val_col,
                     float(inducing_field), float(inclination), float(declination),
                     float(csx), float(csy), float(csz),
-                    float(pad_x), float(pad_y), float(pad_z)
+                    float(pad_x), float(pad_y), float(pad_z),
+                    n_cpu=n_cpu,
+                    memory_mode=memory_mode
                 )
-                # --- END OF UPDATE ---
+
+                # --- NEW: Build Reference Model from Euler Results ---
+                reference_model = None
+                status_message = ""
+                if json_euler_results:
+                    euler_df = pd.read_json(io.StringIO(json_euler_results), orient='split')
+                    if not euler_df.empty:
+                        status_message = "--> Using Euler results to constrain inversion.\n"
+                        reference_model = np.zeros(n_active)
+                        active_cell_centers = sim.mesh.cell_centers[sim.active_cells]
+                        tree = cKDTree(active_cell_centers)
+                        # Assume a small, non-zero susceptibility for the reference model
+                        ref_susceptibility = 0.01
+                        dist, indices = tree.query(euler_df[['X', 'Y', 'Z_depth']].values, k=1)
+                        reference_model[indices] = ref_susceptibility
+                # --- END OF REFERENCE MODEL LOGIC ---
 
                 recovered_model = run_smooth_inversion(
                     sim, data_obj, n_active,
-                    float(alpha_s), float(alpha_x), float(alpha_y), float(alpha_z)
+                    float(alpha_s), float(alpha_x), float(alpha_y), float(alpha_z),
+                    reference_model=reference_model  # Pass the constrained model
                 )
 
                 results = {
@@ -119,12 +151,12 @@ class SmoothInversionTab:
                         'vnC': list(sim.mesh.vnC)
                     }
                 }
-                # On success, show the download button
-                return json.dumps(results), dbc.Alert("✅ Smooth Inversion Complete!", color="success"), {'display': 'block'}
+                success_alert = dbc.Alert(f"{status_message}✅ Smooth Inversion Complete!", color="success", style={'white-space': 'pre-wrap'})
+                return json.dumps(results), success_alert, {'display': 'block'}
+
             except Exception as e:
                 import traceback
                 error_message = f"❌ An error occurred during inversion: {e}\n{traceback.format_exc()}"
-                # On failure, hide the download button
                 return None, dbc.Alert(error_message, color="danger", style={'white-space': 'pre-wrap'}), {'display': 'none'}
 
         @self.app.callback(

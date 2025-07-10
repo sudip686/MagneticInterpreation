@@ -1,242 +1,238 @@
-# C:/Users/SUDIPTA CHANDA/PycharmProjects/MagneticInterpreation/utils.py
-
-import io
 import base64
-import numpy as np
+import io
 import multiprocessing
 
-# --- ESSENTIAL FIX for Matplotlib in a web server ---
-# This must be done BEFORE importing pyplot. It tells Matplotlib to use a
-# non-GUI backend, which is thread-safe and prevents the "main thread" error.
-import matplotlib
-
-matplotlib.use('Agg')
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
-# --- END OF FIX ---
-
-import plotly.graph_objects as go
-from discretize import TensorMesh
-from discretize.utils import mesh_builder_xyz, active_from_xyz
+from scipy.interpolate import griddata
+from scipy.linalg import solve
 from scipy.sparse import diags, vstack
+import plotly.graph_objects as go
 
-from simpeg.data import Data
-from simpeg.data_misfit import L2DataMisfit
-from simpeg.directives import (
-    BetaEstimate_ByEig, TargetMisfit, BetaSchedule, SaveOutputEveryIteration,
-    UpdatePreconditioner, UpdateSensitivityWeights, Update_IRLS
+# Corrected imports to use lowercase 'simpeg'
+from simpeg.potential_fields import magnetics
+from simpeg.utils import model_builder
+from simpeg.utils.io_utils import download
+from simpeg import (
+    data,
+    data_misfit,
+    directives,
+    inversion,
+    maps,
+    inverse_problem,
+    optimization,
+    regularization,
+    survey,
+    simulation as simpeg_simulation,  # aliased to avoid conflict
 )
-from simpeg.inverse_problem import BaseInvProblem
-from simpeg.inversion import BaseInversion
-from simpeg.maps import IdentityMap
-from simpeg.optimization import ProjectedGNCG
-from simpeg.regularization import WeightedLeastSquares, Sparse
-from simpeg.potential_fields.magnetics.sources import UniformBackgroundField
-from simpeg.potential_fields.magnetics.receivers import Point as MagPoint
-from simpeg.potential_fields.magnetics.survey import Survey as MagSurvey
-from simpeg.potential_fields.magnetics.simulation import Simulation3DIntegral
-
-
-# --- Matplotlib to Dash Image Conversion ---
-def fig_to_uri(in_fig, **save_args):
-    """
-    Saves a matplotlib figure to a base64 encoded URI for embedding in Dash.
-
-    Args:
-        in_fig (matplotlib.figure.Figure): The matplotlib figure to convert.
-        **save_args: Additional keyword arguments to pass to fig.savefig().
-
-    Returns:
-        str: A base64 encoded URI string (e.g., "data:image/png;base64,...").
-    """
-    out_img = io.BytesIO()
-    in_fig.savefig(out_img, format='png', **save_args)
-    plt.close(in_fig)  # Close the figure to free up memory
-    out_img.seek(0)
-    encoded = base64.b64encode(out_img.read()).decode("ascii")
-    return "data:image/png;base64,{}".format(encoded)
+from discretize import TensorMesh
+from discretize.utils import active_from_xyz, mesh_builder_xyz
 
 
 # --- 3D Inversion Logic ---
+# The following functions are updated based on the provided working snippet
+# to ensure compatibility with your SimPEG environment.
+
 def setup_simpeg_simulation(
         _df, x_col, y_col, z_col, val_col,
         inducing_field_strength, inclination, declination,
         core_cell_size_x, core_cell_size_y, core_cell_size_z,
-        padding_x, padding_y, padding_z
+        padding_x, padding_y, padding_z,
+        n_cpu=None,  # n_cpu is not used in the simulation constructor to avoid errors
+        memory_mode='ram'
 ):
     """
-    Sets up the SimPEG magnetic survey and simulation objects.
+    Sets up the SimPEG magnetic survey and simulation objects using a robust,
+    explicit initialization pattern based on the provided working code.
     """
     receiver_locations = _df[[x_col, y_col, z_col]].values
     dobs = _df[val_col].values
-    components = ["tmi"]  # Total Magnetic Intensity
+    components = ["tmi"]
 
-    # Define the uniform background inducing magnetic field
-    source_field = UniformBackgroundField(receiver_list=[MagPoint(receiver_locations, components=components)],
-                                          amplitude=inducing_field_strength, inclination=inclination,
-                                          declination=declination)
-    survey = MagSurvey(source_field)
+    # Define the source and survey using positional arguments for robustness
+    source_field = magnetics.sources.UniformBackgroundField(
+        [magnetics.receivers.Point(receiver_locations, components=components)],
+        amplitude=inducing_field_strength,
+        inclination=inclination,
+        declination=declination
+    )
+    survey_obj = magnetics.survey.Survey([source_field])
 
+    # Build the mesh
     mesh = mesh_builder_xyz(
         receiver_locations,
         [core_cell_size_x, core_cell_size_y, core_cell_size_z],
-        padding_distance=[
-            [padding_x, padding_x],
-            [padding_y, padding_y],
-            [padding_z, padding_z]
-        ],
+        padding_distance=[[padding_x, padding_x], [padding_y, padding_y], [padding_z, padding_z]],
         mesh_type='TENSOR'
     )
 
+    # Define the active cells (below the topography)
     active_cells = active_from_xyz(mesh, receiver_locations, grid_reference='N')
-
-    if active_cells.sum() == 0:
-        raise ValueError(
-            "No active cells found. This might be due to data points being outside the mesh, or too small core cell size. Adjust data or mesh parameters.")
-
     n_active = int(active_cells.sum())
-    model_map = IdentityMap(nP=n_active)
+    if n_active == 0:
+        raise ValueError("No active cells found below data points. Adjust data or mesh parameters.")
 
-    # More conservative memory management
-    sens_storage_option = "ram" if n_active < 50_000 else "disk"
+    model_map = maps.IdentityMap(nP=n_active)
 
-    # --- CORRECTED SIMULATION CALL ---
-    # The 'n_cpu' argument is not a valid keyword for this constructor, so it is removed.
-    # The 'store_sensitivities' argument is correct and remains.
-    simulation = Simulation3DIntegral(
-        survey=survey,
+    # Use the older, more robust keywords from your working snippet.
+    simulation = magnetics.simulation.Simulation3DIntegral(
         mesh=mesh,
+        survey=survey_obj,
         model_map=model_map,
         active_cells=active_cells,
-        store_sensitivities=sens_storage_option
+        store_sensitivities=memory_mode
     )
-    # --- END OF CORRECTION ---
-
+    # This explicit assignment is good practice with older versions.
     simulation.chiMap = model_map
-    simulation.model = np.zeros(n_active)
 
+    # Define the data object with standard deviation
     standard_deviation = np.maximum(0.02 * np.abs(dobs), 0.001) + 2
-    data_object = Data(survey, dobs=dobs, standard_deviation=standard_deviation)
+    data_object = data.Data(survey=survey_obj, dobs=dobs, standard_deviation=standard_deviation)
 
     return simulation, data_object, n_active
 
 
-def run_smooth_inversion(_simulation, _data_object, _n_active, alpha_s, alpha_x, alpha_y, alpha_z):
-    """
-    Runs a smooth (L2-norm) inversion using SimPEG.
-    """
-    dmis = L2DataMisfit(data=_data_object, simulation=_simulation)
+def run_smooth_inversion(
+        _simulation, _data_object, _n_active,
+        alpha_s, alpha_x, alpha_y, alpha_z,
+        reference_model=None
+):
+    """Runs a smooth (L2-norm) inversion using a robust directive-based setup."""
+    dmis = data_misfit.L2DataMisfit(data=_data_object, simulation=_simulation)
 
-    reg = WeightedLeastSquares(
-        mesh=_simulation.mesh, active_cells=_simulation.active_cells,
+    reg = regularization.WeightedLeastSquares(
+        mesh=_simulation.mesh,
+        active_cells=_simulation.active_cells,
         alpha_s=alpha_s, alpha_x=alpha_x, alpha_y=alpha_y, alpha_z=alpha_z
     )
-    reg.reference_model = np.zeros(_n_active)
 
-    opt = ProjectedGNCG(maxIter=20, lower=0.0, upper=10.0, maxIterLS=20, maxIterCG=30, tolCG=1e-3)
-    inv_prob = BaseInvProblem(dmis, reg, opt)
-    m0 = np.ones(_n_active) * 1e-4
-    inv_prob.model = m0
+    # Handle the reference model from Euler deconvolution if provided
+    if reference_model is not None and reference_model.shape[0] == _n_active:
+        reg.reference_model = reference_model
+        m0 = reference_model.copy()  # Start from the reference model
+    else:
+        # Default starting model and reference model
+        m0 = np.ones(_n_active) * 1e-4
+        reg.reference_model = np.zeros(_n_active)
 
-    _simulation.model = m0
-    _simulation.chiMap = _simulation.model_map
+    opt = optimization.ProjectedGNCG(maxIter=20, lower=0.0, upper=10.0, maxIterLS=20, maxIterCG=30, tolCG=1e-3)
+    inv_prob = inverse_problem.BaseInvProblem(dmis, reg, opt)
 
-    target_misfit = TargetMisfit(target=_data_object.survey.nD)
-    starting_beta = BetaEstimate_ByEig(beta0_ratio=1e1)
-    beta_schedule = BetaSchedule(coolingFactor=5, coolingRate=2)
-    save_iteration = SaveOutputEveryIteration(save_txt=False)
-    update_jacobi = UpdatePreconditioner()
-
+    # Set up a more detailed directive list based on the working example
+    target_misfit = directives.TargetMisfit(chifact=1)
+    starting_beta = directives.BetaEstimate_ByEig(beta0_ratio=1e1)
+    beta_schedule = directives.BetaSchedule(coolingFactor=5, coolingRate=2)
+    save_iteration = directives.SaveOutputEveryIteration(save_txt=False)
+    update_jacobi = directives.UpdatePreconditioner()
     directiveList = [starting_beta, target_misfit, beta_schedule, save_iteration, update_jacobi]
 
-    inv = BaseInversion(inv_prob, directiveList=directiveList)
+    inv = inversion.BaseInversion(inv_prob, directiveList=directiveList)
 
     try:
+        # Run the inversion
         recovered_model = inv.run(m0)
     except MemoryError as e:
         raise MemoryError(
-            "A MemoryError occurred during the smooth inversion. The problem is too large for the available RAM. Please reduce the problem size by increasing the 'Cell Size' values in the UI.") from e
+            "A MemoryError occurred. The problem is too large for the available RAM. "
+            "Please reduce the problem size by increasing the 'Cell Size' values in the UI."
+        ) from e
 
     return recovered_model
 
 
-def run_sparse_inversion(_simulation, _data_object, _n_active, alpha_s, alpha_x, alpha_y, alpha_z, p_s, p_x, p_y, p_z):
-    """
-    Runs a sparse (IRLS) inversion using SimPEG.
-    """
-    dmis = L2DataMisfit(data=_data_object, simulation=_simulation)
+def run_sparse_inversion(
+        _simulation, _data_object, _n_active,
+        alpha_s, alpha_x, alpha_y, alpha_z,
+        p_s, p_x, p_y, p_z,
+        reference_model=None
+):
+    """Runs a sparse (IRLS) inversion using a robust directive-based setup."""
+    dmis = data_misfit.L2DataMisfit(data=_data_object, simulation=_simulation)
 
-    reg = Sparse(
-        mesh=_simulation.mesh, active_cells=_simulation.active_cells,
+    reg = regularization.Sparse(
+        mesh=_simulation.mesh,
+        active_cells=_simulation.active_cells,
         alpha_s=alpha_s, alpha_x=alpha_x, alpha_y=alpha_y, alpha_z=alpha_z
     )
-    reg.reference_model = np.zeros(_n_active)
     reg.norms = [p_s, p_x, p_y, p_z]
 
-    opt = ProjectedGNCG(maxIter=100, lower=0.0, upper=10.0, maxIterLS=20, maxIterCG=30, tolCG=1e-3)
-    inv_prob = BaseInvProblem(dmis, reg, opt)
-    m0 = np.ones(_n_active) * 1e-4
-    inv_prob.model = m0
+    # Handle the reference model from Euler deconvolution if provided
+    if reference_model is not None and reference_model.shape[0] == _n_active:
+        reg.reference_model = reference_model
+        m0 = reference_model.copy()
+    else:
+        # Default starting model and reference model
+        m0 = np.ones(_n_active) * 1e-4
+        reg.reference_model = np.zeros(_n_active)
 
-    _simulation.model = m0
-    _simulation.chiMap = _simulation.model_map
+    opt = optimization.ProjectedGNCG(maxIter=100, lower=0.0, upper=10.0, maxIterLS=20, maxIterCG=30, tolCG=1e-3)
+    inv_prob = inverse_problem.BaseInvProblem(dmis, reg, opt)
 
-    sensitivity_weights = UpdateSensitivityWeights(every_iteration=False)
-    starting_beta = BetaEstimate_ByEig(beta0_ratio=1)
-    update_jacobi = UpdatePreconditioner()
-    update_IRLS = Update_IRLS(
+    # Set up a more detailed directive list for IRLS based on the working example
+    sensitivity_weights = directives.UpdateSensitivityWeights(every_iteration=False)
+    starting_beta = directives.BetaEstimate_ByEig(beta0_ratio=1)
+    update_jacobi = directives.UpdatePreconditioner()
+    update_IRLS = directives.Update_IRLS(
         f_min_change=1e-4, max_irls_iterations=30, coolEpsFact=1.5,
         beta_tol=1e-2, chifact_target=1
     )
     directiveList = [sensitivity_weights, starting_beta, update_IRLS, update_jacobi]
 
-    inv = BaseInversion(inv_prob, directiveList=directiveList)
+    inv = inversion.BaseInversion(inv_prob, directiveList=directiveList)
 
     try:
+        # Run the inversion
         recovered_model = inv.run(m0)
     except MemoryError as e:
         raise MemoryError(
-            "A MemoryError occurred during the sparse inversion. The problem is too large for the available RAM. Please reduce the problem size by increasing the 'Cell Size' values in the UI.") from e
+            "A MemoryError occurred. The problem is too large for the available RAM. "
+            "Please reduce the problem size by increasing the 'Cell Size' values in the UI."
+        ) from e
 
     return recovered_model
 
 
-def plot_simpeg_slice(mesh_props: dict, model: np.ndarray, active_cells: np.ndarray, slice_direction: str,
-                      slice_location: int) -> plt.Figure:
-    """
-    Plots a slice of the recovered 3D SimPEG model.
-    """
-    h_temp = [np.array(h_dim) for h_dim in mesh_props['h']]
-    x0_temp = np.array(mesh_props['x0'])
-    mesh = TensorMesh(h_temp, x0=x0_temp)
+# ==============================================================================
+# EULER DECONVOLUTION FUNCTION
+# ==============================================================================
+def run_euler_deconvolution(df, x_col, y_col, val_col, structural_index, window_size):
+    print(f"--> Starting Euler Deconvolution with SI={structural_index} and window={window_size}...")
+    grid_res_x = (df[x_col].max() - df[x_col].min()) / 100
+    grid_res_y = (df[y_col].max() - df[y_col].min()) / 100
+    grid_res = np.mean([grid_res_x, grid_res_y])
+    grid_x, grid_y = np.mgrid[
+                     df[x_col].min():df[x_col].max():grid_res,
+                     df[y_col].min():df[y_col].max():grid_res
+                     ]
+    grid_tmi = griddata(df[[x_col, y_col]].values, df[val_col].values, (grid_x, grid_y), method='cubic')
+    grid_tmi[np.isnan(grid_tmi)] = np.nanmean(grid_tmi)
+    dz, dx = np.gradient(grid_tmi, grid_res)
+    dy, _ = np.gradient(grid_tmi.T, grid_res)
+    dy = dy.T
+    solutions = []
+    w = window_size // 2
+    for i in range(w, grid_x.shape[0] - w):
+        for j in range(w, grid_x.shape[1] - w):
+            win_x = grid_x[i - w:i + w, j - w:j + w].ravel()
+            win_y = grid_y[i - w:i + w, j - w:j + w].ravel()
+            win_dx = dx[i - w:i + w, j - w:j + w].ravel()
+            win_dy = dy[i - w:i + w, j - w:j + w].ravel()
+            win_dz = dz[i - w:i + w, j - w:j + w].ravel()
+            win_tmi = grid_tmi[i - w:i + w, j - w:j + w].ravel()
+            x_center, y_center = grid_x[i, j], grid_y[i, j]
+            A = np.vstack([win_dx, win_dy, win_dz, np.full_like(win_dx, -structural_index)]).T
+            b = win_x * win_dx + win_y * win_dy - structural_index * win_tmi
+            try:
+                sol, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+                solutions.append([x_center, y_center, -sol[2]])
+            except np.linalg.LinAlgError:
+                continue
+    if not solutions:
+        return pd.DataFrame(columns=['X', 'Y', 'Z_depth'])
+    return pd.DataFrame(solutions, columns=['X', 'Y', 'Z_depth'])
 
-    full_model = np.full(mesh.nC, np.nan)
-    full_model[active_cells] = model
-
-    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-
-    if slice_direction == 'X':
-        max_idx = mesh_props['vnC'][0] - 1
-    elif slice_direction == 'Y':
-        max_idx = mesh_props['vnC'][1] - 1
-    else:  # Z
-        max_idx = mesh_props['vnC'][2] - 1
-
-    current_slice_location = int(min(max(slice_location, 0), max_idx))
-
-    plot_obj = mesh.plot_slice(full_model, normal=slice_direction, ind=current_slice_location, ax=ax, grid=True,
-                               pcolor_opts={"cmap": "viridis"})[0]
-    cb = plt.colorbar(plot_obj, ax=ax)
-    cb.set_label("Recovered Susceptibility (SI)")
-    ax.set_aspect('equal', adjustable='box')
-
-    title_map = {'X': f"East-West Slice (Index: {current_slice_location})",
-                 'Y': f"North-South Slice (Index: {current_slice_location})",
-                 'Z': f"Horizontal Slice (Index: {current_slice_location})"}
-    ax.set_title(title_map[slice_direction])
-    return fig
-
-
-# --- START: LINEAR INVERSION LOGIC ---
+# --- START: LINEAR INVERSION LOGIC (UNCHANGED) ---
 class LinearInversion:
     def __init__(self, M=100, N=20, p=-0.25, q=2.0):
         self.M, self.N, self.p, self.q = M, N, p, q
@@ -270,7 +266,7 @@ class LinearInversion:
         return W, w_m
 
     def run(self, G, dobs, uncertainty, beta, alpha_s, alpha_x, m_ref):
-        Wd = diags(1 / uncertainty, 0)
+        Wd = diags(1 / (uncertainty + 1e-8), 0) # Add epsilon to avoid division by zero
         G_w = Wd @ G
         d_w = Wd @ dobs
         W, w_m = self._get_W(alpha_s, alpha_x, m_ref)
@@ -343,3 +339,42 @@ def plot_tikhonov_curve(phi_ds: list, phi_ms: list, selected_beta_index: int, ta
     return fig
 
 # --- END: LINEAR INVERSION LOGIC ---
+
+# --- 3D PLOTTING FUNCTION ---
+
+def plot_simpeg_slice(mesh_props, model, active_cells, direction='Z', location_index=None):
+    h_temp = [np.array(h_dim) for h_dim in mesh_props['h']]
+    x0_temp = np.array(mesh_props['x0'])
+    mesh = TensorMesh(h_temp, x0=x0_temp)
+    full_model = np.full(mesh.nC, np.nan)
+    full_model[active_cells] = model
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    dim_map = {'X': 0, 'Y': 1, 'Z': 2}
+    max_idx = mesh.shape_cells[dim_map[direction]] - 1
+    if location_index is None:
+        location_index = max_idx // 2
+    location_index = int(min(max(location_index, 0), max_idx))
+    mesh.plot_slice(
+        full_model,
+        ax=ax,
+        normal=direction,
+        ind=location_index,
+        grid=True,
+        pcolor_opts={"cmap": "viridis"}
+    )
+    ax.set_aspect('equal')
+    slice_coord = mesh.cell_centers[location_index, dim_map[direction]]
+    ax.set_title(f'Model Slice at {direction}={slice_coord:.1f}m (Index: {location_index})')
+    plt.tight_layout()
+    return fig
+
+
+def fig_to_uri(fig):
+    """
+    Converts a matplotlib figure to a URI for display in Dash.
+    """
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    data = base64.b64encode(buf.getbuffer()).decode("ascii")
+    return "data:image/png;base64,{}".format(data)

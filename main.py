@@ -1,5 +1,3 @@
-# C:/Users/SUDIPTA CHANDA/PycharmProjects/MagneticInterpreation/main.py
-
 import base64
 import io
 import pandas as pd
@@ -13,6 +11,8 @@ from tabs.visualization_tab import Visualization3DTab
 from tabs.smooth_inversion_tab import SmoothInversionTab
 from tabs.sparse_inversion_tab import SparseInversionTab
 from tabs.linear_inversion_tab import LinearInversionTab
+# --- NEW: Import the Euler Deconvolution tab ---
+from tabs.euler_deconvolution_tab import EulerDeconvolutionTab
 
 # --- APP INITIALIZATION ---
 app = dash.Dash(
@@ -69,8 +69,6 @@ def build_sidebar():
                         dbc.Label("Declination (°)", className="mt-2"),
                         dcc.Input(id='declination-input', type='number', value=0.0),
                         html.Hr(),
-
-                        # --- START: UPDATED MESH CONTROLS ---
                         html.Div("Core Mesh Discretization", className="mt-3 fw-bold"),
                         dbc.Row([
                             dbc.Col(dbc.Label("Cell Size X (m)"), width=6),
@@ -82,7 +80,6 @@ def build_sidebar():
                         ]),
                         dbc.Label("Cell Size Z (m)", className="mt-2"),
                         dcc.Input(id='core-cell-size-z-input', type='number', value=50.0, min=1.0, className="mb-2"),
-
                         html.Div("Mesh Padding (m)", className="mt-3 fw-bold"),
                         dbc.Row([
                             dbc.Col(dbc.Label("X Padding"), width=6),
@@ -94,8 +91,6 @@ def build_sidebar():
                         ]),
                         dbc.Label("Z Padding (Downwards)", className="mt-2"),
                         dcc.Input(id='padding-z-input', type='number', value=200.0, className="mb-2"),
-                        # --- END: UPDATED MESH CONTROLS ---
-
                         html.Div("Alpha Values (Regularization Weights)", className="mt-3 fw-bold"),
                         dbc.Label("Alpha S (Smallness)"),
                         dcc.Slider(id='alpha-s-slider', min=0, max=10, step=0.1, value=1, marks=None,
@@ -109,6 +104,33 @@ def build_sidebar():
                         dbc.Label("Alpha Z (Smoothness Z)"),
                         dcc.Slider(id='alpha-z-slider', min=0, max=10, step=0.1, value=1, marks=None,
                                    tooltip={"placement": "bottom", "always_visible": True}),
+                        # --- PERFORMANCE CONTROLS ---
+                        html.Hr(),
+                        html.Div("Performance & Memory", className="mt-3 fw-bold"),
+                        dbc.Label("Number of CPU Cores to Use:"),
+                        dcc.Dropdown(
+                            id='cpu-count-dropdown',
+                            options=[
+                                {'label': '1 Core (Slowest)', 'value': 1},
+                                {'label': '2 Cores', 'value': 2},
+                                {'label': '4 Cores (Recommended)', 'value': 4},
+                                {'label': '8 Cores (Fastest)', 'value': 8},
+                            ],
+                            value=4,  # A sensible default
+                            clearable=False,
+                            className="mb-2"
+                        ),
+                        dbc.Label("Sensitivity Matrix Storage:"),
+                        dbc.RadioItems(
+                            id='memory-mode-radio',
+                            options=[
+                                {'label': 'In-Memory (Faster, High RAM)', 'value': 'ram'},
+                                {'label': 'On-Disk (Slower, Low RAM)', 'value': 'disk'},
+                            ],
+                            value='ram',  # Default to the faster in-memory option
+                            inline=True,
+                            className="mb-2"
+                        ),
                     ],
                     title="2. 3D Inversion Parameters",
                 ),
@@ -170,6 +192,8 @@ def build_sidebar():
 # --- INSTANTIATE TAB CLASSES ---
 data_preview = DataPreviewTab(app)
 vis_3d = Visualization3DTab(app)
+# --- NEW: Instantiate the Euler Deconvolution tab ---
+euler_deconvolution = EulerDeconvolutionTab(app)
 smooth_inv = SmoothInversionTab(app)
 sparse_inv = SparseInversionTab(app)
 linear_inv = LinearInversionTab(app)
@@ -184,6 +208,8 @@ app.layout = dbc.Container([
             dcc.Tabs(id="tabs", children=[
                 dcc.Tab(label="📄 Data Preview", children=data_preview.layout()),
                 dcc.Tab(label="📊 3D Visualization", children=vis_3d.layout()),
+                # --- NEW: Add the Euler tab to the layout ---
+                dcc.Tab(label="💡 Euler Deconvolution", children=euler_deconvolution.layout()),
                 dcc.Tab(label="🔄 Smooth Inversion (L2)", children=smooth_inv.layout()),
                 dcc.Tab(label="✨ Sparse Inversion (IRLS)", children=sparse_inv.layout()),
                 dcc.Tab(label="📉 1D Linear Inversion", children=linear_inv.layout()),
@@ -197,6 +223,8 @@ app.layout = dbc.Container([
     dcc.Store(id='smooth-inversion-results-store'),
     dcc.Store(id='sparse-inversion-results-store'),
     dcc.Store(id='linear-inversion-results-store'),
+    # --- NEW: Store for Euler results to constrain inversions ---
+    dcc.Store(id='euler-results-store'),
 ], fluid=True)
 
 
@@ -217,10 +245,10 @@ def handle_upload(contents, filename, skip_rows):
     try:
         first_line = io.StringIO(decoded.decode('utf-8')).readline()
         sep = ',' if ',' in first_line else r'\s+'
-        df = pd.read_csv(io.StringIO(decoded.decode('utf-8')), sep=sep, engine='python', skiprows=skip_rows or 0)
+        df = pd.read_csv(
+            io.StringIO(decoded.decode('utf-8')), sep=sep, engine='python', skiprows=skip_rows or 0)
         df.columns = df.columns.str.strip()
         for col in df.columns:
-            # This loop is for basic validation, but the main processing happens in the next callback
             df[col] = pd.to_numeric(df[col], errors='coerce')
         df.dropna(inplace=True)
         if df.empty:
@@ -283,6 +311,10 @@ def toggle_z_source(use_constant):
         return {'display': 'block', 'margin-top': '5px'}, {'display': 'none'}
 
 
-# --- RUN THE APP ---
+# ==============================================================================
+# 4. RUN THE APP
+# ==============================================================================
 if __name__ == '__main__':
+    # Use debug=True for local development
+    # For Colab, use app.run(jupyter_mode="inline")
     app.run(debug=True)
